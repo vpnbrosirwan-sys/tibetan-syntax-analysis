@@ -4,6 +4,7 @@ import { useState, useRef, useCallback, useEffect } from "react";
 import { Menu } from "lucide-react";
 import { AnimatePresence, motion } from "framer-motion";
 import type { AnalyzedSentence } from "@/lib/types";
+import { saveSessions, loadSessions, saveMessages, loadMessages, hydrateMessages, saveBookmarks, loadBookmarks } from "@/lib/storage";
 import ChatInput from "./chat/chat-input";
 import MessageBubble, { type ChatMessage } from "./chat/message-bubble";
 import Sidebar, { type ChatSession } from "./chat/sidebar";
@@ -13,18 +14,47 @@ function generateId() {
 }
 
 export default function Analyzer() {
-  // Sessions
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
-
-  // Messages per session
   const [messagesBySession, setMessagesBySession] = useState<Record<string, ChatMessage[]>>({});
   const [isProcessing, setIsProcessing] = useState(false);
+  const [bookmarks, setBookmarks] = useState<Record<string, number[]>>({});
+  const [loaded, setLoaded] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
 
   const messages = activeSessionId ? messagesBySession[activeSessionId] || [] : [];
+
+  // Load from localStorage on mount
+  useEffect(() => {
+    const storedSessions = loadSessions();
+    const storedMessages = hydrateMessages(loadMessages());
+    const storedBookmarks = loadBookmarks();
+
+    if (storedSessions.length > 0) {
+      setSessions(storedSessions);
+      setMessagesBySession(storedMessages as Record<string, ChatMessage[]>);
+      setActiveSessionId(storedSessions[0].id);
+    }
+    setBookmarks(storedBookmarks);
+    setLoaded(true);
+  }, []);
+
+  // Persist sessions whenever they change
+  useEffect(() => {
+    if (loaded) saveSessions(sessions);
+  }, [sessions, loaded]);
+
+  // Persist messages whenever they change (debounced by checking loaded)
+  useEffect(() => {
+    if (loaded) saveMessages(messagesBySession as any);
+  }, [messagesBySession, loaded]);
+
+  // Persist bookmarks
+  useEffect(() => {
+    if (loaded) saveBookmarks(bookmarks);
+  }, [bookmarks, loaded]);
 
   const scrollToBottom = useCallback(() => {
     setTimeout(() => messagesEndRef.current?.scrollIntoView({ behavior: "smooth" }), 100);
@@ -60,23 +90,38 @@ export default function Analyzer() {
       delete next[id];
       return next;
     });
-    if (activeSessionId === id) {
-      // Switch to another session or create new
-      const remaining = sessions.filter((s) => s.id !== id);
-      if (remaining.length > 0) {
-        setActiveSessionId(remaining[0].id);
-      } else {
-        setActiveSessionId(null);
+    // Clean up bookmarks for this session
+    setBookmarks((prev) => {
+      const next = { ...prev };
+      for (const key of Object.keys(next)) {
+        if (key.startsWith(id + "-")) delete next[key];
       }
+      return next;
+    });
+    if (activeSessionId === id) {
+      const remaining = sessions.filter((s) => s.id !== id);
+      setActiveSessionId(remaining.length > 0 ? remaining[0].id : null);
     }
   }, [activeSessionId, sessions]);
 
   // Auto-create first session
   useEffect(() => {
-    if (sessions.length === 0) {
+    if (loaded && sessions.length === 0) {
       startNewSession();
     }
-  }, [sessions.length, startNewSession]);
+  }, [sessions.length, startNewSession, loaded]);
+
+  const toggleBookmark = useCallback((messageId: string, sentenceIndex: number) => {
+    const key = `${activeSessionId}-${messageId}`;
+    setBookmarks((prev) => {
+      const current = prev[key] || [];
+      const exists = current.includes(sentenceIndex);
+      return {
+        ...prev,
+        [key]: exists ? current.filter((i) => i !== sentenceIndex) : [...current, sentenceIndex],
+      };
+    });
+  }, [activeSessionId]);
 
   const handleSend = useCallback(
     async (text: string, files: File[]) => {
@@ -85,7 +130,6 @@ export default function Analyzer() {
         sessionId = startNewSession();
       }
 
-      // Build user message
       const userImages: string[] = [];
       for (const f of files) {
         if (f.type.startsWith("image/")) {
@@ -118,7 +162,6 @@ export default function Analyzer() {
         [sessionId!]: [...(prev[sessionId!] || []), userMsg, assistantMsg],
       }));
 
-      // Update session title from first message
       const title = text
         ? text.substring(0, 30) + (text.length > 30 ? "..." : "")
         : `圖片分析 (${files.length} 張)`;
@@ -139,16 +182,14 @@ export default function Analyzer() {
       try {
         let tibetanText = text;
 
-        // Step 1: OCR if files uploaded
         if (files.length > 0) {
           const formData = new FormData();
           for (const f of files) formData.append("file", f);
 
-          const ocrTimeout = AbortSignal.timeout(300_000);
           const ocrRes = await fetch("/api/ocr", {
             method: "POST",
             body: formData,
-            signal: AbortSignal.any([controller.signal, ocrTimeout]),
+            signal: AbortSignal.any([controller.signal, AbortSignal.timeout(300_000)]),
           });
           const ocrData = await ocrRes.json();
           if (!ocrRes.ok) throw new Error(ocrData.error || "OCR failed");
@@ -161,15 +202,11 @@ export default function Analyzer() {
           scrollToBottom();
         }
 
-        // Step 2: Syntax analysis via SSE (batched)
         if (!tibetanText) throw new Error("No text to analyze");
 
         const analyzeRes = await fetch("/api/analyze", {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Accept: "text/event-stream",
-          },
+          headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
           body: JSON.stringify({ text: tibetanText }),
           signal: controller.signal,
         });
@@ -179,7 +216,6 @@ export default function Analyzer() {
           throw new Error(errData.error || "Analysis failed");
         }
 
-        // Read SSE stream for batch progress
         const reader = analyzeRes.body?.getReader();
         const decoder = new TextDecoder();
         let analysisResult: { sentences: unknown[] } | null = null;
@@ -189,11 +225,9 @@ export default function Analyzer() {
           while (true) {
             const { done, value } = await reader.read();
             if (done) break;
-
             buffer += decoder.decode(value, { stream: true });
             const lines = buffer.split("\n");
             buffer = lines.pop() || "";
-
             let eventType = "";
             for (const line of lines) {
               if (line.startsWith("event: ")) {
@@ -250,104 +284,10 @@ export default function Analyzer() {
     setIsProcessing(false);
   }, []);
 
-  const handleExport = useCallback(
-    (msg: ChatMessage) => {
-      if (!msg.sentences) return;
-
-      const posColors: Record<string, { bg: string; color: string; label: string }> = {
-        noun:         { bg: "#dbeafe", color: "#1e3a5f", label: "名詞" },
-        verb:         { bg: "#fee2e2", color: "#7f1d1d", label: "動詞" },
-        adjective:    { bg: "#d1fae5", color: "#064e3b", label: "形容詞" },
-        adverb:       { bg: "#ede9fe", color: "#3b0764", label: "副詞" },
-        pronoun:      { bg: "#fef3c7", color: "#78350f", label: "代詞" },
-        particle:     { bg: "#f5f5f4", color: "#292524", label: "助詞" },
-        numeral:      { bg: "#ccfbf1", color: "#134e4a", label: "數詞" },
-        conjunction:  { bg: "#ffedd5", color: "#7c2d12", label: "連詞" },
-        postposition: { bg: "#fce7f3", color: "#831843", label: "後置詞" },
-        interjection: { bg: "#fef9c3", color: "#713f12", label: "感嘆詞" },
-        unknown:      { bg: "#f5f5f4", color: "#57534e", label: "未知" },
-      };
-      const roleLabels: Record<string, string> = {
-        subject: "主語", object: "賓語", predicate: "謂語",
-        modifier: "修飾語", complement: "補語", topic: "主題",
-      };
-
-      let html = `<!DOCTYPE html><html lang="zh-Hant"><head><meta charset="UTF-8">
-<title>藏文語法分析報告</title>
-<style>
-  @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+Tibetan:wght@400;600&display=swap');
-  body { font-family: -apple-system, BlinkMacSystemFont, 'PingFang TC', sans-serif; max-width: 800px; margin: 0 auto; padding: 24px; color: #1c1917; background: #fff; }
-  .tibetan { font-family: 'Noto Sans Tibetan', sans-serif; line-height: 1.8; }
-  h1 { font-size: 20px; border-bottom: 2px solid #e7e5e4; padding-bottom: 8px; }
-  .meta { font-size: 12px; color: #78716c; margin-bottom: 24px; }
-  .sentence-block { margin-bottom: 24px; padding: 16px; border: 1px solid #e7e5e4; border-radius: 12px; }
-  .original { font-size: 18px; margin-bottom: 4px; }
-  .translation { font-size: 14px; color: #44403c; margin-bottom: 12px; }
-  .words { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
-  .word { display: inline-flex; flex-direction: column; align-items: center; padding: 6px 10px; border-radius: 8px; border: 1px solid #d6d3d1; min-width: 56px; }
-  .word .tib { font-size: 16px; }
-  .word .cn { font-size: 13px; margin-top: 2px; }
-  .word .pos { font-size: 10px; margin-top: 2px; font-weight: 600; }
-  .word .role { font-size: 9px; opacity: 0.7; }
-  .structure { font-size: 12px; color: #44403c; border-top: 1px solid #e7e5e4; padding-top: 8px; }
-  .notes { font-size: 12px; color: #57534e; font-style: italic; }
-  .legend { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 20px; }
-  .legend span { font-size: 11px; padding: 2px 8px; border-radius: 12px; }
-  .ocr-section { background: #fafaf9; border: 1px solid #e7e5e4; border-radius: 8px; padding: 12px; margin-bottom: 20px; }
-  .ocr-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; color: #a8a29e; margin-bottom: 4px; }
-</style></head><body>
-<h1>📜 藏文語法分析報告</h1>
-<p class="meta">日期：${msg.timestamp.toLocaleString("zh-TW")}</p>`;
-
-      // Legend
-      html += `<div class="legend">`;
-      for (const [, v] of Object.entries(posColors)) {
-        html += `<span style="background:${v.bg};color:${v.color}">${v.label}</span>`;
-      }
-      html += `</div>`;
-
-      // OCR text
-      if (msg.extractedText) {
-        html += `<div class="ocr-section"><p class="ocr-label">OCR 識別結果</p><p class="tibetan" style="font-size:15px">${msg.extractedText.replace(/\n/g, "<br>")}</p></div>`;
-      }
-
-      // Sentences
-      for (const s of msg.sentences) {
-        html += `<div class="sentence-block">`;
-        html += `<p class="original tibetan">${s.original}</p>`;
-        html += `<p class="translation">${s.chineseTranslation}</p>`;
-        html += `<div class="words">`;
-        for (const w of s.words) {
-          const c = posColors[w.pos] || posColors.unknown;
-          html += `<div class="word" style="background:${c.bg};border-color:${c.bg};color:${c.color}" title="${w.notes || ""}">`;
-          html += `<span class="tib tibetan">${w.tibetan}</span>`;
-          html += `<span class="cn">${w.chineseTranslation}</span>`;
-          html += `<span class="pos">${c.label}</span>`;
-          if (w.syntacticRole) html += `<span class="role">${roleLabels[w.syntacticRole] || w.syntacticRole}</span>`;
-          html += `</div>`;
-        }
-        html += `</div>`;
-        if (s.structure) html += `<p class="structure"><strong>句子結構：</strong>${s.structure}</p>`;
-        if (s.notes) html += `<p class="notes">${s.notes}</p>`;
-        html += `</div>`;
-      }
-
-      html += `</body></html>`;
-
-      const blob = new Blob([html], { type: "text/html;charset=utf-8" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `藏文語法分析-${new Date().toLocaleDateString("zh-TW")}.html`;
-      a.click();
-      URL.revokeObjectURL(url);
-    },
-    []
-  );
+  if (!loaded) return null;
 
   return (
     <div className="h-dvh flex bg-white">
-      {/* Sidebar */}
       <Sidebar
         sessions={sessions}
         activeSessionId={activeSessionId}
@@ -358,9 +298,7 @@ export default function Analyzer() {
         onClose={() => setSidebarOpen(false)}
       />
 
-      {/* Main chat area */}
       <div className="flex-1 flex flex-col min-w-0">
-        {/* Top bar */}
         <header className="flex items-center gap-2 px-2 py-1.5 border-b border-stone-100 bg-white/80 backdrop-blur-sm sticky top-0 z-30">
           <button
             onClick={() => setSidebarOpen(true)}
@@ -374,7 +312,6 @@ export default function Analyzer() {
           </div>
         </header>
 
-        {/* Messages */}
         <div className="flex-1 overflow-y-auto px-2 py-2 space-y-2">
           {messages.length === 0 && (
             <div className="flex flex-col items-center justify-center h-full text-center text-stone-400 space-y-3">
@@ -396,9 +333,14 @@ export default function Analyzer() {
               >
                 <MessageBubble
                   message={msg}
-                  onExport={
+                  bookmarkedSentences={
                     msg.role === "assistant" && msg.status === "complete"
-                      ? () => handleExport(msg)
+                      ? new Set(bookmarks[`${activeSessionId}-${msg.id}`] || [])
+                      : undefined
+                  }
+                  onToggleBookmark={
+                    msg.role === "assistant" && msg.status === "complete"
+                      ? (index: number) => toggleBookmark(msg.id, index)
                       : undefined
                   }
                 />
@@ -409,7 +351,6 @@ export default function Analyzer() {
           <div ref={messagesEndRef} />
         </div>
 
-        {/* Input */}
         <div className="border-t border-stone-100 bg-white px-2 py-2">
           <div className="max-w-none">
             <ChatInput

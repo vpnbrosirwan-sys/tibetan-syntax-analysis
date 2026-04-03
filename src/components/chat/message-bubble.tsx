@@ -20,9 +20,11 @@ export interface ChatMessage {
 interface MessageBubbleProps {
   message: ChatMessage;
   onExport?: () => void;
+  bookmarkedSentences?: Set<number>;
+  onToggleBookmark?: (index: number) => void;
 }
 
-export default function MessageBubble({ message, onExport }: MessageBubbleProps) {
+export default function MessageBubble({ message, onExport, bookmarkedSentences, onToggleBookmark }: MessageBubbleProps) {
   const isUser = message.role === "user";
 
   return (
@@ -111,6 +113,8 @@ export default function MessageBubble({ message, onExport }: MessageBubbleProps)
                 sentences={message.sentences}
                 extractedText={message.extractedText}
                 onExport={onExport}
+                bookmarkedSentences={bookmarkedSentences}
+                onToggleBookmark={onToggleBookmark}
               />
             )}
           </div>
