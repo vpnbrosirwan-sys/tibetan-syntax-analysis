@@ -30,7 +30,6 @@ const ROLE_LABELS: Record<string, string> = {
 interface SyntaxArtifactProps {
   sentences: AnalyzedSentence[];
   extractedText?: string;
-  onExport?: () => void;
   bookmarkedSentences?: Set<number>;
   onToggleBookmark?: (index: number) => void;
 }
@@ -38,7 +37,6 @@ interface SyntaxArtifactProps {
 export default function SyntaxArtifact({
   sentences,
   extractedText,
-  onExport,
   bookmarkedSentences,
   onToggleBookmark,
 }: SyntaxArtifactProps) {
